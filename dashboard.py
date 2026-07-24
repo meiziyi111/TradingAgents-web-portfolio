@@ -27,6 +27,18 @@ try:
 except ImportError:
     pass
 
+# Streamlit Community Cloud exposes deployment secrets through ``st.secrets``.
+# The tradingagents package reads provider credentials from environment
+# variables, so bridge only scalar top-level secrets into the process without
+# ever writing them to disk or displaying them.
+try:
+    for _secret_name, _secret_value in st.secrets.items():
+        if isinstance(_secret_value, (str, int, float, bool)):
+            os.environ[str(_secret_name)] = str(_secret_value)
+except Exception:
+    # Local runs without Streamlit secrets continue to use .env / OS variables.
+    pass
+
 st.set_page_config(
     page_title="TradingAgents 分析面板",
     page_icon="📊",
