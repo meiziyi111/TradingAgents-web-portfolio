@@ -2,6 +2,7 @@
 
 from typing import List, Optional
 from pathlib import Path
+from datetime import date
 import re
 
 from tradingagents.agents.utils.rating import parse_rating
@@ -13,8 +14,16 @@ class TradingMemoryLog:
     # HTML comment: cannot appear in LLM prose output, safe as a hard delimiter
     _SEPARATOR = "\n\n<!-- ENTRY_END -->\n\n"
     # Precompiled patterns — avoids re-compilation on every load_entries() call
-    _DECISION_RE = re.compile(r"DECISION:\n(.*?)(?=\nREFLECTION:|\Z)", re.DOTALL)
+    _DECISION_RE = re.compile(
+        r"DECISION:\n(.*?)(?=\n(?:OUTCOME_OBSERVED_AT|MEMORY_AVAILABLE_AT|"
+        r"REFLECTION_CREATED_AT|REFLECTION):|\Z)",
+        re.DOTALL,
+    )
     _REFLECTION_RE = re.compile(r"REFLECTION:\n(.*?)$", re.DOTALL)
+    _METADATA_RE = re.compile(
+        r"^(OUTCOME_OBSERVED_AT|MEMORY_AVAILABLE_AT|REFLECTION_CREATED_AT):\s*(.+)$",
+        re.MULTILINE,
+    )
 
     def __init__(self, config: dict = None):
         cfg = config or {}
@@ -68,9 +77,37 @@ class TradingMemoryLog:
         """Return entries with outcome:pending (for Phase B)."""
         return [e for e in self.load_entries() if e.get("pending")]
 
-    def get_past_context(self, ticker: str, n_same: int = 5, n_cross: int = 3) -> str:
-        """Return formatted past context string for agent prompt injection."""
+    def get_past_context(
+        self,
+        ticker: str,
+        n_same: int = 5,
+        n_cross: int = 3,
+        as_of_date: Optional[str] = None,
+    ) -> str:
+        """Return past context that was genuinely available by ``as_of_date``.
+
+        Legacy callers that omit ``as_of_date`` retain the old latest-context
+        behaviour. Historical replay callers must provide it. Resolved legacy
+        entries without ``MEMORY_AVAILABLE_AT`` are excluded conservatively
+        because their reflection availability cannot be proved.
+        """
         entries = [e for e in self.load_entries() if not e.get("pending")]
+        if as_of_date:
+            try:
+                cutoff = date.fromisoformat(str(as_of_date)[:10])
+            except ValueError as exc:
+                raise ValueError("as_of_date must use YYYY-MM-DD format") from exc
+
+            def available_at_cutoff(entry: dict) -> bool:
+                available_at = entry.get("memory_available_at")
+                if not available_at:
+                    return False
+                try:
+                    return date.fromisoformat(str(available_at)[:10]) <= cutoff
+                except ValueError:
+                    return False
+
+            entries = [e for e in entries if available_at_cutoff(e)]
         if not entries:
             return ""
 
@@ -105,6 +142,9 @@ class TradingMemoryLog:
         alpha_return: float,
         holding_days: int,
         reflection: str,
+        outcome_observed_at: Optional[str] = None,
+        memory_available_at: Optional[str] = None,
+        reflection_created_at: Optional[str] = None,
     ) -> None:
         """Replace pending tag and append REFLECTION section using atomic write.
 
@@ -146,8 +186,14 @@ class TradingMemoryLog:
                     f" | {raw_pct} | {alpha_pct} | {holding_days}d]"
                 )
                 rest = "\n".join(lines[1:])
+                metadata = self._format_availability_metadata(
+                    outcome_observed_at=outcome_observed_at,
+                    memory_available_at=memory_available_at,
+                    reflection_created_at=reflection_created_at,
+                )
                 new_blocks.append(
-                    f"{new_tag}\n\n{rest.lstrip()}\n\nREFLECTION:\n{reflection}"
+                    f"{new_tag}\n\n{rest.lstrip()}"
+                    f"{metadata}\n\nREFLECTION:\n{reflection}"
                 )
                 updated = True
             else:
@@ -166,7 +212,9 @@ class TradingMemoryLog:
         """Apply multiple outcome updates in a single read + atomic write.
 
         Each element of updates must have keys: ticker, trade_date,
-        raw_return, alpha_return, holding_days, reflection.
+        raw_return, alpha_return, holding_days, reflection. Point-in-time
+        callers should also provide outcome_observed_at, memory_available_at,
+        and reflection_created_at.
         """
         if not self._log_path or not self._log_path.exists() or not updates:
             return
@@ -200,8 +248,14 @@ class TradingMemoryLog:
                         f" | {raw_pct} | {alpha_pct} | {upd['holding_days']}d]"
                     )
                     rest = "\n".join(lines[1:])
+                    metadata = self._format_availability_metadata(
+                        outcome_observed_at=upd.get("outcome_observed_at"),
+                        memory_available_at=upd.get("memory_available_at"),
+                        reflection_created_at=upd.get("reflection_created_at"),
+                    )
                     new_blocks.append(
-                        f"{new_tag}\n\n{rest.lstrip()}\n\nREFLECTION:\n{upd['reflection']}"
+                        f"{new_tag}\n\n{rest.lstrip()}"
+                        f"{metadata}\n\nREFLECTION:\n{upd['reflection']}"
                     )
                     del update_map[(trade_date, ticker)]
                     matched = True
@@ -279,6 +333,13 @@ class TradingMemoryLog:
         reflection_match = self._REFLECTION_RE.search(body)
         entry["decision"] = decision_match.group(1).strip() if decision_match else ""
         entry["reflection"] = reflection_match.group(1).strip() if reflection_match else ""
+        metadata = {
+            key.lower(): value.strip()
+            for key, value in self._METADATA_RE.findall(body)
+        }
+        entry["outcome_observed_at"] = metadata.get("outcome_observed_at")
+        entry["memory_available_at"] = metadata.get("memory_available_at")
+        entry["reflection_created_at"] = metadata.get("reflection_created_at")
         return entry
 
     def _format_full(self, e: dict) -> str:
@@ -287,6 +348,8 @@ class TradingMemoryLog:
         holding = e["holding"] or "n/a"
         tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {raw} | {alpha} | {holding}]"
         parts = [tag, f"DECISION:\n{e['decision']}"]
+        if e.get("outcome_observed_at"):
+            parts.append(f"OUTCOME_OBSERVED_AT: {e['outcome_observed_at']}")
         if e["reflection"]:
             parts.append(f"REFLECTION:\n{e['reflection']}")
         return "\n\n".join(parts)
@@ -298,3 +361,19 @@ class TradingMemoryLog:
         text = e["decision"][:300]
         suffix = "..." if len(e["decision"]) > 300 else ""
         return f"{tag}\n{text}{suffix}"
+
+    @staticmethod
+    def _format_availability_metadata(
+        *,
+        outcome_observed_at: Optional[str],
+        memory_available_at: Optional[str],
+        reflection_created_at: Optional[str],
+    ) -> str:
+        """Render optional availability fields without breaking legacy logs."""
+        values = [
+            ("OUTCOME_OBSERVED_AT", outcome_observed_at),
+            ("MEMORY_AVAILABLE_AT", memory_available_at),
+            ("REFLECTION_CREATED_AT", reflection_created_at),
+        ]
+        lines = [f"{key}: {value}" for key, value in values if value]
+        return ("\n\n" + "\n".join(lines)) if lines else ""

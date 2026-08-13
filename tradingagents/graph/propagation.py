@@ -21,6 +21,8 @@ class Propagator:
         trade_date: str,
         asset_type: str = "stock",
         past_context: str = "",
+        portfolio_context: Optional[Dict[str, Any]] = None,
+        run_id: str = "",
     ) -> Dict[str, Any]:
         """Create the initial state for the agent graph."""
         return {
@@ -28,7 +30,9 @@ class Propagator:
             "company_of_interest": company_name,
             "asset_type": asset_type,
             "trade_date": str(trade_date),
+            "run_id": run_id,
             "past_context": past_context,
+            "portfolio_context": portfolio_context or {"source": "unavailable"},
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",
@@ -37,6 +41,7 @@ class Propagator:
                     "current_response": "",
                     "judge_decision": "",
                     "count": 0,
+                    "structured_reviews": [],
                 }
             ),
             "risk_debate_state": RiskDebateState(

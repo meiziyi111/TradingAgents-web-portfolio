@@ -10,6 +10,8 @@ back gracefully to free-text generation.
 
 from __future__ import annotations
 
+import json
+
 from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
@@ -17,7 +19,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.structured import (
     bind_structured,
-    invoke_structured_or_freetext,
+    invoke_structured_or_freetext_with_artifact,
 )
 
 
@@ -31,6 +33,9 @@ def create_portfolio_manager(llm):
         risk_debate_state = state["risk_debate_state"]
         research_plan = state["investment_plan"]
         trader_plan = state["trader_investment_plan"]
+        trading_proposal = state.get("trading_proposal_structured", {})
+        portfolio_context = state.get("portfolio_context", {"source": "unavailable"})
+        structured_risk_reviews = risk_debate_state.get("structured_reviews", [])
 
         past_context = state.get("past_context", "")
         lessons_line = (
@@ -51,19 +56,23 @@ def create_portfolio_manager(llm):
 - **Hold**: Maintain current position, no action needed
 - **Underweight**: Reduce exposure, take partial profits
 - **Sell**: Exit position or avoid entry
+- **Abstain**: Evidence or portfolio inputs are insufficient for a defensible recommendation
 
 **Context:**
 - Research Manager's investment plan: **{research_plan}**
-- Trader's transaction proposal: **{trader_plan}**
+- Typed Trader proposal: **{json.dumps(trading_proposal, ensure_ascii=False)}**
+- Human-readable Trader proposal: **{trader_plan}**
+- Typed risk reviews: **{json.dumps(structured_risk_reviews, ensure_ascii=False)}**
+- Portfolio context: **{json.dumps(portfolio_context, ensure_ascii=False)}**
 {lessons_line}
 **Risk Analysts Debate History:**
 {history}
 
 ---
 
-Be decisive. You must provide a concrete price target, stop-loss level, position sizing rule, and the evidence supporting each conclusion. Return the decision as valid JSON matching the required schema; do not omit any required field. Use these exact top-level field names: rating, executive_summary, investment_thesis, price_target, stop_loss, position_sizing, and time_horizon. The final rating belongs in `rating`; do not replace it with `action`.{get_language_instruction()}"""
+Produce an advisory PortfolioRecommendation, not an execution order. Use proposed_position as a decimal portfolio weight. Never invent missing current price or portfolio facts: use rating Abstain, list missing_fields, and explain abstain_reason when necessary. Return valid JSON matching the schema. The deterministic Hard Risk Engine will validate all numeric constraints after this node.{get_language_instruction()}"""
 
-        final_trade_decision = invoke_structured_or_freetext(
+        final_trade_decision, structured_decision = invoke_structured_or_freetext_with_artifact(
             structured_llm,
             llm,
             prompt,
@@ -83,11 +92,23 @@ Be decisive. You must provide a concrete price target, stop-loss level, position
             "current_conservative_response": risk_debate_state["current_conservative_response"],
             "current_neutral_response": risk_debate_state["current_neutral_response"],
             "count": risk_debate_state["count"],
+            "structured_reviews": structured_risk_reviews,
         }
 
         return {
             "risk_debate_state": new_risk_debate_state,
+            "portfolio_recommendation": final_trade_decision,
+            "portfolio_recommendation_structured": (
+                structured_decision.model_dump(mode="json")
+                if structured_decision is not None
+                else None
+            ),
             "final_trade_decision": final_trade_decision,
+            "final_trade_decision_structured": (
+                structured_decision.model_dump(mode="json")
+                if structured_decision is not None
+                else None
+            ),
         }
 
     return portfolio_manager_node
