@@ -6,9 +6,11 @@ from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.observability import traced_node
 
 from .analyst_execution import build_analyst_execution_plan
 from .conditional_logic import ConditionalLogic
+from .hard_risk import hard_risk_node
 
 
 class GraphSetup:
@@ -70,19 +72,43 @@ class GraphSetup:
 
         # Add analyst nodes to the graph
         for spec in plan.specs:
-            workflow.add_node(spec.agent_node, analyst_factories[spec.key]())
-            workflow.add_node(spec.clear_node, create_msg_delete())
+            workflow.add_node(
+                spec.agent_node,
+                traced_node(spec.agent_node, analyst_factories[spec.key]()),
+            )
+            workflow.add_node(
+                spec.clear_node,
+                traced_node(spec.clear_node, create_msg_delete()),
+            )
             workflow.add_node(spec.tool_node, self.tool_nodes[spec.key])
 
         # Add other nodes
-        workflow.add_node("Bull Researcher", bull_researcher_node)
-        workflow.add_node("Bear Researcher", bear_researcher_node)
-        workflow.add_node("Research Manager", research_manager_node)
-        workflow.add_node("Trader", trader_node)
-        workflow.add_node("Aggressive Analyst", aggressive_analyst)
-        workflow.add_node("Neutral Analyst", neutral_analyst)
-        workflow.add_node("Conservative Analyst", conservative_analyst)
-        workflow.add_node("Portfolio Manager", portfolio_manager_node)
+        workflow.add_node(
+            "Bull Researcher", traced_node("Bull Researcher", bull_researcher_node)
+        )
+        workflow.add_node(
+            "Bear Researcher", traced_node("Bear Researcher", bear_researcher_node)
+        )
+        workflow.add_node(
+            "Research Manager", traced_node("Research Manager", research_manager_node)
+        )
+        workflow.add_node("Trader", traced_node("Trader", trader_node))
+        workflow.add_node(
+            "Aggressive Analyst", traced_node("Aggressive Analyst", aggressive_analyst)
+        )
+        workflow.add_node(
+            "Neutral Analyst", traced_node("Neutral Analyst", neutral_analyst)
+        )
+        workflow.add_node(
+            "Conservative Analyst",
+            traced_node("Conservative Analyst", conservative_analyst),
+        )
+        workflow.add_node(
+            "Portfolio Manager", traced_node("Portfolio Manager", portfolio_manager_node)
+        )
+        workflow.add_node(
+            "Hard Risk Engine", traced_node("Hard Risk Engine", hard_risk_node)
+        )
 
         # Define edges
         # Start with the first analyst
@@ -152,6 +178,7 @@ class GraphSetup:
             },
         )
 
-        workflow.add_edge("Portfolio Manager", END)
+        workflow.add_edge("Portfolio Manager", "Hard Risk Engine")
+        workflow.add_edge("Hard Risk Engine", END)
 
         return workflow

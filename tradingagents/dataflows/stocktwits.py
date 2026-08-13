@@ -21,6 +21,8 @@ from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .provenance import record_tool_trace
+
 logger = logging.getLogger(__name__)
 
 _API = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
@@ -42,6 +44,11 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
             data = json.loads(resp.read())
     except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
         logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
+        record_tool_trace({
+            "tool": "fetch_stocktwits_messages", "vendor": "stocktwits",
+            "status": "ERROR", "source_uri": url,
+            "error_type": type(exc).__name__, "error": str(exc)[:500],
+        })
         return f"<stocktwits unavailable: {type(exc).__name__}>"
 
     messages = data.get("messages", []) if isinstance(data, dict) else []
@@ -80,4 +87,9 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
         f"Unlabeled: {unlabeled} · "
         f"Total: {total} most-recent messages"
     )
+    record_tool_trace({
+        "tool": "fetch_stocktwits_messages", "vendor": "stocktwits",
+        "status": "SUCCESS", "source_uri": url, "arguments": [ticker, limit],
+        "records_returned": total,
+    })
     return summary + "\n\n" + "\n".join(lines)

@@ -1,4 +1,17 @@
+import logging
+import hashlib
+import re
+from datetime import datetime, timezone
 from typing import Annotated
+
+logger = logging.getLogger(__name__)
+
+
+def _redact_error(message: str) -> str:
+    """Remove common credential query/header shapes before persistence."""
+    redacted = re.sub(r"(?i)(apikey|api_key|token)=([^&\s]+)", r"\1=REDACTED", message)
+    redacted = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+", r"\1REDACTED", redacted)
+    return redacted[:500]
 
 # Import from vendor-specific modules
 from .y_finance import (
@@ -26,6 +39,7 @@ from .alpha_vantage_common import AlphaVantageRateLimitError
 
 # Configuration and routing logic
 from .config import get_config
+from .provenance import record_tool_trace
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -147,6 +161,11 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
+    failures = []
+    source_uris = {
+        "yfinance": "https://finance.yahoo.com/",
+        "alpha_vantage": "https://www.alphavantage.co/query",
+    }
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -154,9 +173,45 @@ def route_to_vendor(method: str, *args, **kwargs):
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
+        started_at = datetime.now(timezone.utc).isoformat()
         try:
-            return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+            result = impl_func(*args, **kwargs)
+            if isinstance(result, str) and result.lstrip().lower().startswith("error"):
+                raise RuntimeError(result)
+            result_text = result if isinstance(result, str) else repr(result)
+            unavailable = "unavailable" in result_text[:500].lower()
+            record_tool_trace({
+                "tool": method,
+                "vendor": vendor,
+                "attempt": len(failures) + 1,
+                "status": "UNAVAILABLE" if unavailable else "SUCCESS",
+                "requested_at": started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "arguments": [str(value) for value in args],
+                "keyword_arguments": {key: str(value) for key, value in kwargs.items()},
+                "source_uri": source_uris.get(vendor),
+                "output_sha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
+            })
+            return result
+        except Exception as exc:
+            safe_error = _redact_error(str(exc))
+            failures.append(f"{vendor}: {type(exc).__name__}: {safe_error}")
+            record_tool_trace({
+                "tool": method,
+                "vendor": vendor,
+                "attempt": len(failures),
+                "status": "ERROR",
+                "requested_at": started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "arguments": [str(value) for value in args],
+                "keyword_arguments": {key: str(value) for key, value in kwargs.items()},
+                "source_uri": source_uris.get(vendor),
+                "error_type": type(exc).__name__,
+                "error": safe_error,
+            })
+            logger.warning("%s failed via %s: %s", method, vendor, exc)
+            continue
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    raise RuntimeError(
+        f"No available vendor for '{method}'. Attempts: " + " | ".join(failures)
+    )

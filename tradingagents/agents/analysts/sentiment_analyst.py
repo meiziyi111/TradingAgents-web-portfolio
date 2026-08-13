@@ -29,6 +29,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.dataflows.provenance import record_tool_trace
 
 
 def _seven_days_back(trade_date: str) -> str:
@@ -53,8 +54,30 @@ def create_sentiment_analyst(llm):
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
-        stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
+        if datetime.strptime(end_date, "%Y-%m-%d").date() == datetime.now().date():
+            stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
+            reddit_block = fetch_reddit_posts(ticker)
+        else:
+            stocktwits_block = (
+                f"<stocktwits unavailable: live-only source is not point-in-time "
+                f"safe for historical as_of_date {end_date}>"
+            )
+            reddit_block = (
+                f"<reddit unavailable: live search is not point-in-time safe for "
+                f"historical as_of_date {end_date}>"
+            )
+            record_tool_trace({
+                "tool": "fetch_stocktwits_messages", "vendor": "stocktwits",
+                "status": "UNAVAILABLE", "source_uri": "https://stocktwits.com/",
+                "as_of_date": end_date,
+                "reason": "live-only source disabled for historical run",
+            })
+            record_tool_trace({
+                "tool": "fetch_reddit_posts", "vendor": "reddit",
+                "status": "UNAVAILABLE", "source_uri": "https://www.reddit.com/",
+                "as_of_date": end_date,
+                "reason": "live search disabled for historical run",
+            })
 
         system_message = _build_system_message(
             ticker=ticker,

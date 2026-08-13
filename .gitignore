@@ -217,3 +217,16 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# React frontend
+frontend/node_modules/
+
+# Public web release runtime artifacts
+frontend/dist/
+*.log
+*.zip
+reports/*
+!reports/NVDA/
+reports/NVDA/*
+!reports/NVDA/2026-07-24/
+!reports/NVDA/2026-07-24/complete_report.md

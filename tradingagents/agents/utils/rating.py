@@ -1,4 +1,4 @@
-"""Shared 5-tier rating vocabulary and a deterministic heuristic parser.
+"""Shared rating vocabulary and a deterministic heuristic parser.
 
 The same five-tier scale (Buy, Overweight, Hold, Underweight, Sell) is used by:
 - The Research Manager (investment plan recommendation)
@@ -20,7 +20,7 @@ RATINGS_5_TIER: Tuple[str, ...] = (
     "Buy", "Overweight", "Hold", "Underweight", "Sell",
 )
 
-_RATING_SET = {r.lower() for r in RATINGS_5_TIER}
+_RATING_SET = {r.lower() for r in RATINGS_5_TIER} | {"abstain"}
 
 # Matches "Rating: X" / "rating - X" / "Rating: **X**" — tolerates markdown
 # bold wrappers and either a colon or hyphen separator.
@@ -28,7 +28,7 @@ _RATING_LABEL_RE = re.compile(r"rating.*?[:\-][\s*]*(\w+)", re.IGNORECASE)
 
 
 def parse_rating(text: str, default: str = "Hold") -> str:
-    """Heuristically extract a 5-tier rating from prose text.
+    """Heuristically extract a position rating or explicit Abstain from text.
 
     Two-pass strategy:
     1. Look for an explicit "Rating: X" label (tolerant of markdown bold).

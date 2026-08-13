@@ -42,10 +42,13 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
     data = data.dropna(subset=["Date"])
 
-    price_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in data.columns]
+    price_cols = [c for c in ["Open", "High", "Low", "Close"] if c in data.columns]
     data[price_cols] = data[price_cols].apply(pd.to_numeric, errors="coerce")
-    # Forward-fill before dropping so the latest trading day survives
-    data[price_cols] = data[price_cols].ffill().bfill()
+    # Forward fill uses only information already observed. Back-filling is
+    # prohibited because it can copy a future price into an earlier row.
+    data[price_cols] = data[price_cols].ffill()
+    if "Volume" in data.columns:
+        data["Volume"] = pd.to_numeric(data["Volume"], errors="coerce")
     data = data.dropna(subset=["Close"])
 
     return data
@@ -59,21 +62,28 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """
     safe_ticker_component(symbol)  # validate ticker
 
-    start_date = pd.Timestamp.today() - pd.DateOffset(years=5)
+    cutoff = pd.Timestamp(curr_date).normalize()
+    start_date = cutoff - pd.DateOffset(years=5)
+    end_date = cutoff + pd.Timedelta(days=1)
     data = yf_retry(lambda: yf.download(
         symbol,
         start=start_date.strftime("%Y-%m-%d"),
-        end=pd.Timestamp.today().strftime("%Y-%m-%d"),
+        end=end_date.strftime("%Y-%m-%d"),
         multi_level_index=False,
         progress=False,
         auto_adjust=True,
     ))
     data = data.reset_index()
     data = _clean_dataframe(data)
+    data = data[data["Date"].dt.normalize() <= cutoff]
     return data
 
 
-def filter_financials_by_date(data: pd.DataFrame, curr_date: str) -> pd.DataFrame:
+def filter_financials_by_date(
+    data: pd.DataFrame,
+    curr_date: str,
+    availability_lag_days: int = 0,
+) -> pd.DataFrame:
     """Drop financial statement columns (fiscal period timestamps) after curr_date.
 
     yfinance financial statements use fiscal period end dates as columns.
@@ -82,7 +92,10 @@ def filter_financials_by_date(data: pd.DataFrame, curr_date: str) -> pd.DataFram
     """
     if not curr_date or data.empty:
         return data
-    cutoff = pd.Timestamp(curr_date)
+    # yfinance columns are fiscal-period ends, not filing timestamps. Apply an
+    # explicit conservative lag so a period is not treated as public on the
+    # day it ends. This remains an approximation, not true point-in-time data.
+    cutoff = pd.Timestamp(curr_date) - pd.Timedelta(days=availability_lag_days)
     mask = pd.to_datetime(data.columns, errors="coerce") <= cutoff
     return data.loc[:, mask]
 

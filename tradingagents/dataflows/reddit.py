@@ -20,6 +20,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .provenance import record_tool_trace
+
 logger = logging.getLogger(__name__)
 
 _API = "https://www.reddit.com/r/{sub}/search.json?{qs}"
@@ -99,8 +101,18 @@ def fetch_reddit_posts(
         blocks.append("\n".join(lines))
 
     if total_posts == 0:
+        record_tool_trace({
+            "tool": "fetch_reddit_posts", "vendor": "reddit",
+            "status": "UNAVAILABLE", "source_uri": "https://www.reddit.com/",
+            "arguments": [ticker], "records_returned": 0,
+        })
         return (
             f"<no Reddit posts found mentioning {ticker.upper()} across "
             f"{', '.join(f'r/{s}' for s in subreddits)} in the past 7 days>"
         )
+    record_tool_trace({
+        "tool": "fetch_reddit_posts", "vendor": "reddit",
+        "status": "SUCCESS", "source_uri": "https://www.reddit.com/",
+        "arguments": [ticker], "records_returned": total_posts,
+    })
     return "\n\n".join(blocks)

@@ -3,7 +3,7 @@
 from typing import Optional
 
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
 from .config import get_config
@@ -78,6 +78,11 @@ def get_news_yfinance(
         # Parse date range for filtering
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        if end_dt < datetime.now() - timedelta(days=30):
+            return (
+                f"<news unavailable for {ticker}: Yahoo's current news feed is not a "
+                f"historical archive for as_of_date {end_date}>"
+            )
 
         news_str = ""
         filtered_count = 0
@@ -85,11 +90,12 @@ def get_news_yfinance(
         for article in news:
             data = _extract_article_data(article)
 
-            # Filter by date if publish time is available
-            if data["pub_date"]:
-                pub_date_naive = data["pub_date"].replace(tzinfo=None)
-                if not (start_dt <= pub_date_naive <= end_dt + relativedelta(days=1)):
-                    continue
+            # Unknown publication time cannot satisfy a point-in-time boundary.
+            if not data["pub_date"]:
+                continue
+            pub_date_naive = data["pub_date"].replace(tzinfo=None)
+            if not (start_dt <= pub_date_naive <= end_dt + relativedelta(days=1)):
+                continue
 
             news_str += f"### {data['title']} (source: {data['publisher']})\n"
             if data["summary"]:
@@ -127,6 +133,12 @@ def get_global_news_yfinance(
         Formatted string containing global news articles
     """
     config = get_config()
+    curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    if curr_dt < datetime.now() - timedelta(days=30):
+        return (
+            f"<global news unavailable: Yahoo Search is not a historical archive "
+            f"for as_of_date {curr_date}>"
+        )
     if look_back_days is None:
         look_back_days = config["global_news_lookback_days"]
     if limit is None:
@@ -165,7 +177,6 @@ def get_global_news_yfinance(
             return f"No global news found for {curr_date}"
 
         # Calculate date range
-        curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
         start_dt = curr_dt - relativedelta(days=look_back_days)
         start_date = start_dt.strftime("%Y-%m-%d")
 
@@ -174,20 +185,20 @@ def get_global_news_yfinance(
             # Handle both flat and nested structures
             if "content" in article:
                 data = _extract_article_data(article)
-                # Skip articles published after curr_date (look-ahead guard)
-                if data.get("pub_date"):
-                    pub_naive = data["pub_date"].replace(tzinfo=None) if hasattr(data["pub_date"], "replace") else data["pub_date"]
-                    if pub_naive > curr_dt + relativedelta(days=1):
-                        continue
+                # Enforce both sides of the point-in-time window. Unknown
+                # publication timestamps are excluded rather than guessed.
+                if not data.get("pub_date"):
+                    continue
+                pub_naive = data["pub_date"].replace(tzinfo=None)
+                if not (start_dt <= pub_naive <= curr_dt + relativedelta(days=1)):
+                    continue
                 title = data["title"]
                 publisher = data["publisher"]
                 link = data["link"]
                 summary = data["summary"]
             else:
-                title = article.get("title", "No title")
-                publisher = article.get("publisher", "Unknown")
-                link = article.get("link", "")
-                summary = ""
+                # Flat responses do not expose a trustworthy publication time.
+                continue
 
             news_str += f"### {title} (source: {publisher})\n"
             if summary:

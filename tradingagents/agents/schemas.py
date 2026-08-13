@@ -19,7 +19,7 @@ so that:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,7 @@ class PortfolioRating(str, Enum):
     HOLD = "Hold"
     UNDERWEIGHT = "Underweight"
     SELL = "Sell"
+    ABSTAIN = "Abstain"
 
 
 class TraderAction(str, Enum):
@@ -51,6 +52,22 @@ class TraderAction(str, Enum):
     BUY = "Buy"
     HOLD = "Hold"
     SELL = "Sell"
+    ABSTAIN = "Abstain"
+
+
+class PortfolioContextSource(str, Enum):
+    """Provenance of portfolio inputs used by the risk engine."""
+
+    REAL = "real"
+    DEMO = "demo"
+    UNAVAILABLE = "unavailable"
+
+
+class RiskValidationStatus(str, Enum):
+    VALID = "VALID"
+    ADJUSTED = "ADJUSTED"
+    REJECTED = "REJECTED"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +133,13 @@ class TraderProposal(BaseModel):
     """
 
     action: TraderAction = Field(
-        description="The transaction direction. Exactly one of Buy / Hold / Sell.",
+        description="The transaction direction. Exactly one of Buy / Hold / Sell / Abstain.",
+    )
+    conviction: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in the proposal from 0.0 to 1.0; not a calibrated probability.",
     )
     reasoning: str = Field(
         description=(
@@ -128,19 +151,41 @@ class TraderProposal(BaseModel):
         default=None,
         description="Entry price target in the instrument's quote currency. Provide a specific price level.",
     )
-    stop_loss: float = Field(
+    stop_loss: Optional[float] = Field(
+        default=None,
         description=(
-            "REQUIRED: stop-loss price in the instrument's quote currency. "
-            "Always provide a concrete stop-loss level based on technical support "
-            "levels or ATR."
+            "Proposed stop-loss price. Use null instead of guessing when the data "
+            "does not support a defensible level."
         ),
     )
-    position_sizing: str = Field(
-        min_length=1,
+    price_target: Optional[float] = Field(
+        default=None,
+        description="Proposed price target; null when evidence is insufficient.",
+    )
+    proposed_position: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Proposed post-trade portfolio weight as a decimal, e.g. 0.06 for 6%.",
+    )
+    position_sizing: Optional[str] = Field(
+        default=None,
         description=(
-            "REQUIRED: sizing guidance for the proposed transaction, such as "
-            "a portfolio percentage, current exposure limit, or staged order rule."
+            "Human-readable sizing explanation. The numeric source of truth is "
+            "proposed_position."
         ),
+    )
+    time_horizon: Optional[str] = Field(default=None, description="Expected holding period.")
+    key_risks: list[str] = Field(
+        default_factory=list,
+        description="Specific risks that could invalidate the proposal.",
+    )
+    missing_fields: list[str] = Field(
+        default_factory=list,
+        description="Required inputs that were unavailable; never invent them.",
+    )
+    abstain_reason: Optional[str] = Field(
+        default=None,
+        description="Why the Trader abstained, when action is Abstain.",
     )
 
 
@@ -154,17 +199,81 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
     parts = [
         f"**Action**: {proposal.action.value}",
         "",
+        f"**Conviction**: {proposal.conviction:.2f}",
+        "",
         f"**Reasoning**: {proposal.reasoning}",
     ]
     if proposal.entry_price is not None:
         parts.extend(["", f"**Entry Price**: {proposal.entry_price}"])
-    parts.extend(["", f"**Stop Loss**: {proposal.stop_loss}"])
-    parts.extend(["", f"**Position Sizing**: {proposal.position_sizing}"])
+    if proposal.stop_loss is not None:
+        parts.extend(["", f"**Stop Loss**: {proposal.stop_loss}"])
+    if proposal.price_target is not None:
+        parts.extend(["", f"**Price Target**: {proposal.price_target}"])
+    if proposal.proposed_position is not None:
+        parts.extend(["", f"**Proposed Position**: {proposal.proposed_position:.2%}"])
+    if proposal.position_sizing:
+        parts.extend(["", f"**Position Sizing**: {proposal.position_sizing}"])
+    if proposal.time_horizon:
+        parts.extend(["", f"**Time Horizon**: {proposal.time_horizon}"])
+    if proposal.key_risks:
+        parts.extend(["", "**Key Risks**: " + "; ".join(proposal.key_risks)])
+    if proposal.missing_fields:
+        parts.extend(["", "**Missing Fields**: " + ", ".join(proposal.missing_fields)])
+    if proposal.abstain_reason:
+        parts.extend(["", f"**Abstain Reason**: {proposal.abstain_reason}"])
     parts.extend([
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",
     ])
     return "\n".join(parts)
+
+
+# Public business name; retain TraderProposal for backwards compatibility.
+TradingProposal = TraderProposal
+
+
+class RiskReview(BaseModel):
+    """Typed review of the Trader proposal by one risk perspective."""
+
+    accept_action: bool = Field(description="Whether this reviewer accepts the proposed action.")
+    position_assessment: str
+    stop_loss_assessment: str
+    price_target_assessment: str
+    risk_reward_assessment: str
+    key_risks: list[str] = Field(default_factory=list)
+    adjustment_recommendations: list[str] = Field(default_factory=list)
+    narrative: str = Field(description="Concise debate argument grounded in the supplied evidence.")
+
+
+def render_risk_review(review: RiskReview) -> str:
+    return "\n".join([
+        f"**Accept Action**: {'Yes' if review.accept_action else 'No'}",
+        f"**Position Assessment**: {review.position_assessment}",
+        f"**Stop Loss Assessment**: {review.stop_loss_assessment}",
+        f"**Price Target Assessment**: {review.price_target_assessment}",
+        f"**Risk/Reward Assessment**: {review.risk_reward_assessment}",
+        "**Key Risks**: " + ("; ".join(review.key_risks) or "None identified"),
+        "**Adjustments**: " + ("; ".join(review.adjustment_recommendations) or "None"),
+        f"**Narrative**: {review.narrative}",
+    ])
+
+
+class PortfolioContext(BaseModel):
+    """Portfolio facts and policy limits, with explicit provenance."""
+
+    source: PortfolioContextSource = PortfolioContextSource.UNAVAILABLE
+    cash: Optional[float] = Field(default=None, ge=0.0)
+    total_portfolio_value: Optional[float] = Field(default=None, gt=0.0)
+    current_positions: dict[str, float] = Field(default_factory=dict)
+    ticker_current_position: Optional[float] = Field(default=None, ge=0.0)
+    ticker_current_weight: Optional[float] = Field(default=None, ge=0.0)
+    sector_exposure: Optional[float] = Field(default=None, ge=0.0)
+    max_single_position: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    max_sector_exposure: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    risk_budget: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    current_price: Optional[float] = Field(default=None, gt=0.0)
+    price_as_of: Optional[str] = None
+    notes: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +293,7 @@ class PortfolioDecision(BaseModel):
     rating: PortfolioRating = Field(
         description=(
             "The final position rating. Exactly one of Buy / Overweight / Hold / "
-            "Underweight / Sell, picked based on the analysts' debate."
+            "Underweight / Sell / Abstain. Use Abstain when evidence is insufficient."
         ),
     )
     executive_summary: str = Field(
@@ -200,20 +309,27 @@ class PortfolioDecision(BaseModel):
             "incorporate them; otherwise rely solely on the current analysis."
         ),
     )
-    price_target: float = Field(
+    proposed_position: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Proposed post-trade portfolio weight as a decimal.",
+    )
+    price_target: Optional[float] = Field(
+        default=None,
         description=(
             "REQUIRED: target price in the instrument's quote currency. "
             "Provide a concrete price target based on technical and fundamental analysis."
         ),
     )
-    stop_loss: float = Field(
+    stop_loss: Optional[float] = Field(
+        default=None,
         description=(
             "REQUIRED: stop-loss price in the instrument's quote currency. "
             "Provide a concrete stop-loss level based on support levels or risk parameters."
         ),
     )
-    position_sizing: str = Field(
-        min_length=1,
+    position_sizing: Optional[str] = Field(
+        default=None,
         description=(
             "REQUIRED: explain the recommended position size or exposure limit, "
             "including a percentage or concrete sizing rule and why it fits the risk."
@@ -223,6 +339,8 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+    missing_fields: list[str] = Field(default_factory=list)
+    abstain_reason: Optional[str] = None
 
 
 def render_pm_decision(decision: PortfolioDecision) -> str:
@@ -240,9 +358,91 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
         "",
         f"**Investment Thesis**: {decision.investment_thesis}",
     ]
-    parts.extend(["", f"**Price Target**: {decision.price_target}"])
-    parts.extend(["", f"**Stop Loss**: {decision.stop_loss}"])
-    parts.extend(["", f"**Position Sizing**: {decision.position_sizing}"])
+    if decision.proposed_position is not None:
+        parts.extend(["", f"**Proposed Position**: {decision.proposed_position:.2%}"])
+    if decision.price_target is not None:
+        parts.extend(["", f"**Price Target**: {decision.price_target}"])
+    if decision.stop_loss is not None:
+        parts.extend(["", f"**Stop Loss**: {decision.stop_loss}"])
+    if decision.position_sizing:
+        parts.extend(["", f"**Position Sizing**: {decision.position_sizing}"])
     if decision.time_horizon:
         parts.extend(["", f"**Time Horizon**: {decision.time_horizon}"])
+    if decision.missing_fields:
+        parts.extend(["", "**Missing Fields**: " + ", ".join(decision.missing_fields)])
+    if decision.abstain_reason:
+        parts.extend(["", f"**Abstain Reason**: {decision.abstain_reason}"])
+    return "\n".join(parts)
+
+
+class RiskAdjustment(BaseModel):
+    field: str
+    original_value: Any = None
+    adjusted_value: Any = None
+    reason: str
+
+
+class HardRiskValidation(BaseModel):
+    """Deterministic validation result; no field is generated by an LLM."""
+
+    status: RiskValidationStatus
+    checks: dict[str, str] = Field(default_factory=dict)
+    missing_fields: list[str] = Field(default_factory=list)
+    adjustments: list[RiskAdjustment] = Field(default_factory=list)
+    risk_reward_ratio: Optional[float] = None
+    potential_loss: Optional[float] = None
+    potential_loss_fraction: Optional[float] = None
+    validated_position: Optional[float] = None
+    abstain_reason: Optional[str] = None
+
+
+class FinalDecision(BaseModel):
+    """Post-risk-engine decision used by storage and the dashboard."""
+
+    action: TraderAction
+    rating: PortfolioRating
+    validation_status: RiskValidationStatus
+    approved_position: Optional[float] = None
+    entry_price: Optional[float] = None
+    price_target: Optional[float] = None
+    stop_loss: Optional[float] = None
+    risk_reward_ratio: Optional[float] = None
+    potential_loss: Optional[float] = None
+    time_horizon: Optional[str] = None
+    rationale: str
+    missing_fields: list[str] = Field(default_factory=list)
+    abstain_reason: Optional[str] = None
+    execution_enabled: Literal[False] = False
+
+
+def render_final_decision(decision: FinalDecision) -> str:
+    parts = [
+        f"**Rating**: {decision.rating.value}",
+        "",
+        f"**Action**: {decision.action.value}",
+        "",
+        f"**Risk Validation**: {decision.validation_status.value}",
+        "",
+        f"**Rationale**: {decision.rationale}",
+    ]
+    if decision.approved_position is not None:
+        parts.extend(["", f"**Approved Position**: {decision.approved_position:.2%}"])
+        parts.extend(["", f"**Position Sizing**: {decision.approved_position:.2%} of portfolio"])
+    if decision.entry_price is not None:
+        parts.extend(["", f"**Entry Price**: {decision.entry_price}"])
+    if decision.price_target is not None:
+        parts.extend(["", f"**Price Target**: {decision.price_target}"])
+    if decision.stop_loss is not None:
+        parts.extend(["", f"**Stop Loss**: {decision.stop_loss}"])
+    if decision.risk_reward_ratio is not None:
+        parts.extend(["", f"**Risk/Reward**: {decision.risk_reward_ratio:.2f}"])
+    if decision.potential_loss is not None:
+        parts.extend(["", f"**Potential Loss**: {decision.potential_loss:.2f}"])
+    if decision.time_horizon:
+        parts.extend(["", f"**Time Horizon**: {decision.time_horizon}"])
+    if decision.missing_fields:
+        parts.extend(["", "**Missing Fields**: " + ", ".join(decision.missing_fields)])
+    if decision.abstain_reason:
+        parts.extend(["", f"**Abstain Reason**: {decision.abstain_reason}"])
+    parts.extend(["", "**Execution Enabled**: false"])
     return "\n".join(parts)

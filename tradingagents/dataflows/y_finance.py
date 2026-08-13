@@ -251,6 +251,14 @@ def get_fundamentals(
 ):
     """Get company fundamentals overview from yfinance."""
     try:
+        if curr_date:
+            requested = pd.Timestamp(curr_date).normalize()
+            today = pd.Timestamp.today().normalize()
+            if requested < today:
+                return (
+                    f"<fundamentals unavailable for {ticker}: yfinance ticker.info is a current "
+                    f"snapshot and is not point-in-time safe for historical as_of_date {curr_date}>"
+                )
         ticker_obj = yf.Ticker(ticker.upper())
         info = yf_retry(lambda: ticker_obj.info)
 
@@ -316,7 +324,8 @@ def get_balance_sheet(
         else:
             data = yf_retry(lambda: ticker_obj.balance_sheet)
 
-        data = filter_financials_by_date(data, curr_date)
+        availability_lag = 45 if freq.lower() == "quarterly" else 90
+        data = filter_financials_by_date(data, curr_date, availability_lag)
 
         if data.empty:
             return f"No balance sheet data found for symbol '{ticker}'"
@@ -326,6 +335,7 @@ def get_balance_sheet(
         
         # Add header information
         header = f"# Balance Sheet data for {ticker.upper()} ({freq})\n"
+        header += f"# Point-in-time status: APPROXIMATE ({availability_lag}d conservative publication lag)\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         
         return header + csv_string
@@ -348,7 +358,8 @@ def get_cashflow(
         else:
             data = yf_retry(lambda: ticker_obj.cashflow)
 
-        data = filter_financials_by_date(data, curr_date)
+        availability_lag = 45 if freq.lower() == "quarterly" else 90
+        data = filter_financials_by_date(data, curr_date, availability_lag)
 
         if data.empty:
             return f"No cash flow data found for symbol '{ticker}'"
@@ -358,6 +369,7 @@ def get_cashflow(
         
         # Add header information
         header = f"# Cash Flow data for {ticker.upper()} ({freq})\n"
+        header += f"# Point-in-time status: APPROXIMATE ({availability_lag}d conservative publication lag)\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         
         return header + csv_string
@@ -380,7 +392,8 @@ def get_income_statement(
         else:
             data = yf_retry(lambda: ticker_obj.income_stmt)
 
-        data = filter_financials_by_date(data, curr_date)
+        availability_lag = 45 if freq.lower() == "quarterly" else 90
+        data = filter_financials_by_date(data, curr_date, availability_lag)
 
         if data.empty:
             return f"No income statement data found for symbol '{ticker}'"
@@ -390,6 +403,7 @@ def get_income_statement(
         
         # Add header information
         header = f"# Income Statement data for {ticker.upper()} ({freq})\n"
+        header += f"# Point-in-time status: APPROXIMATE ({availability_lag}d conservative publication lag)\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         
         return header + csv_string

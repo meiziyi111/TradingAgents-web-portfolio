@@ -11,6 +11,22 @@ import re
 from pathlib import Path
 from datetime import datetime
 
+from tradingagents.dashboard_ui import (
+    inject_theme,
+    render_agent_grid,
+    render_empty_state,
+    render_legal_footer,
+    render_metric_grid,
+    render_report_hero,
+    render_running_header,
+    render_section_head,
+    render_sidebar_brand,
+    render_stage_rail,
+    render_state_card,
+    render_terminal,
+    signal_tone,
+)
+
 # 启动时加载 .env，确保后续线程能读到环境变量
 try:
     from dotenv import load_dotenv, find_dotenv
@@ -27,23 +43,13 @@ try:
 except ImportError:
     pass
 
-# Streamlit Community Cloud exposes deployment secrets through ``st.secrets``.
-# The tradingagents package reads provider credentials from environment
-# variables, so bridge only scalar top-level secrets into the process without
-# ever writing them to disk or displaying them.
-try:
-    for _secret_name, _secret_value in st.secrets.items():
-        if isinstance(_secret_value, (str, int, float, bool)):
-            os.environ[str(_secret_name)] = str(_secret_value)
-except Exception:
-    # Local runs without Streamlit secrets continue to use .env / OS variables.
-    pass
-
 st.set_page_config(
     page_title="TradingAgents 分析面板",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    # Let Streamlit keep the research controls open on desktop while collapsing
+    # them on narrow screens so the report is not hidden behind the sidebar.
+    initial_sidebar_state="auto",
 )
 
 REPORTS_DIR = Path("reports")
@@ -218,18 +224,21 @@ def extract_info(sections):
         "stop": stop or "N/A",
         "rating": rating if rating != "N/A" else final_signal,
         "position_sizing": sizing or "N/A",
+        "risk_validation": "N/A",
     }
 
 
 # ========== 分析工作线程 ==========
 
-def _analysis_worker(ticker: str, date: str, q: queue.Queue):
+def _analysis_worker(ticker: str, date: str, q: queue.Queue, portfolio_context: dict):
     """在线程中运行分析，通过队列向主线程发送更新。"""
     import traceback
     try:
         from tradingagents.llm_clients.api_key_env import get_api_key_env
         from tradingagents.graph.trading_graph import TradingAgentsGraph
         from tradingagents.default_config import DEFAULT_CONFIG
+        from tradingagents.report_artifacts import write_decision_artifact
+        from tradingagents.dataflows.provenance import get_tool_trace, reset_tool_trace
 
         provider = os.getenv("TRADINGAGENTS_LLM_PROVIDER", "openai").strip().lower()
         key_env = get_api_key_env(provider)
@@ -243,8 +252,10 @@ def _analysis_worker(ticker: str, date: str, q: queue.Queue):
         config["max_debate_rounds"] = 1
         config["max_risk_discuss_rounds"] = 1
         config["output_language"] = "Chinese"
+        config["checkpoint_enabled"] = True
 
         q.put({"type": "log", "msg": f"🚀 开始分析 {ticker} ({date})..."})
+        reset_tool_trace()
 
         ta = TradingAgentsGraph(
             selected_analysts=["market", "social", "news", "fundamentals"],
@@ -252,52 +263,83 @@ def _analysis_worker(ticker: str, date: str, q: queue.Queue):
             config=config,
         )
 
-        init_state = ta.propagator.create_initial_state(ticker, date)
-        args = ta.propagator.get_graph_args()
-
+        # output key -> (UI stage key, title).  The last stage must wait for the
+        # deterministic Hard Risk Engine, rather than being marked complete as
+        # soon as the Portfolio Manager emits its advisory recommendation.
         chapter_titles = {
-            "market_report":         "[1/7] 市场分析报告",
-            "sentiment_report":      "[2/7] 情绪分析报告",
-            "news_report":           "[3/7] 新闻分析报告",
-            "fundamentals_report":   "[4/7] 基本面分析报告",
-            "investment_plan":       "[5/7] 研究团队决策",
-            "trader_investment_plan":"[6/7] 交易团队计划",
-            "final_trade_decision":  "[7/7] 最终交易决策",
+            "market_report": (
+                "market_report", "[1/7] 市场分析报告"
+            ),
+            "sentiment_report": (
+                "sentiment_report", "[2/7] 情绪分析报告"
+            ),
+            "news_report": ("news_report", "[3/7] 新闻分析报告"),
+            "fundamentals_report": (
+                "fundamentals_report", "[4/7] 基本面分析报告"
+            ),
+            "investment_plan": (
+                "investment_plan", "[5/7] 研究团队决策"
+            ),
+            "trader_investment_plan": (
+                "trader_investment_plan", "[6/7] 交易团队计划"
+            ),
+            "final_decision_structured": (
+                "final_trade_decision", "[7/7] 硬风控后的最终交易决策"
+            ),
         }
 
         completed = set()
         final_state = {}
 
-        for chunk in ta.graph.stream(init_state, **args):
+        for chunk in ta.stream_propagate(
+            ticker, date, portfolio_context=portfolio_context
+        ):
             final_state.update(chunk)
-            for key, title in chapter_titles.items():
-                if key in chunk and chunk[key] and key not in completed:
-                    completed.add(key)
-                    q.put({"type": "stage_done", "key": key})
+            for output_key, (stage_key, title) in chapter_titles.items():
+                if (
+                    output_key in chunk
+                    and chunk[output_key]
+                    and output_key not in completed
+                ):
+                    completed.add(output_key)
+                    q.put({"type": "stage_done", "key": stage_key})
                     q.put({"type": "log", "msg": f"  ✅ {title}"})
+        evidence_records = get_tool_trace()
 
-        # Do not save a report that cannot satisfy the PM decision contract.
-        pm_text = str(final_state.get("final_trade_decision", ""))
-        required_fields = {
-            "Price Target": r"\*{0,2}Price Target\*{0,2}\s*[：:]\s*\$?[0-9]+(?:\.[0-9]+)?",
-            "Stop Loss": r"\*{0,2}Stop Loss\*{0,2}\s*[：:]\s*\$?[0-9]+(?:\.[0-9]+)?",
-            "Position Sizing": r"\*{0,2}Position Sizing\*{0,2}\s*[：:]\s*.+",
-        }
-        missing_fields = [
-            name for name, pattern in required_fields.items()
-            if not re.search(pattern, pm_text, flags=re.IGNORECASE)
-        ]
-        if missing_fields:
+        # Validate the Hard Risk Engine's exact typed State value rather than
+        # re-parsing a human-readable Markdown rendering with regex.
+        final_decision = final_state.get("final_decision_structured")
+        if not isinstance(final_decision, dict):
             raise RuntimeError(
-                "Portfolio Manager 输出缺少必填字段："
-                + ", ".join(missing_fields)
-                + "。本次不会保存不完整报告，请重试。"
+                "Hard Risk Engine 未返回已校验的结构化决策。"
+                "本次不会保存无法审计的报告，请重试。"
             )
 
         # 保存报告
         report_dir = REPORTS_DIR / ticker / date
         report_dir.mkdir(parents=True, exist_ok=True)
         report_file = report_dir / "complete_report.md"
+        write_decision_artifact(
+            report_dir / "decision.json",
+            ticker=ticker,
+            trade_date=date,
+            decision_payload=final_decision,
+            trading_proposal_payload=final_state.get("trading_proposal_structured"),
+            risk_reviews_payload=(final_state.get("risk_debate_state") or {}).get(
+                "structured_reviews", []
+            ),
+            portfolio_context_payload=final_state.get("portfolio_context"),
+            portfolio_recommendation_payload=final_state.get(
+                "portfolio_recommendation_structured"
+            ),
+            risk_validation_payload=final_state.get("risk_validation"),
+            evidence_records=evidence_records,
+            run_id=final_state.get("run_id") or ta.current_run_id,
+            trace_summary=(ta.last_trace or {}).get("summary"),
+            trace_file=(
+                Path(ta.last_trace_path).name if ta.last_trace_path else None
+            ),
+        )
 
         with open(report_file, "w", encoding="utf-8") as f:
             f.write(f"# {ticker} 完整分析报告\n")
@@ -334,14 +376,20 @@ def _analysis_worker(ticker: str, date: str, q: queue.Queue):
             if risk_parts:
                 f.write("\n## 风险评估\n\n" + "\n\n".join(risk_parts) + "\n\n---\n")
 
+            f.write("\n## 证据链与数据来源\n\n")
+            if evidence_records:
+                for record in evidence_records:
+                    f.write(
+                        f"- `{record.get('tool')}` via `{record.get('vendor')}` | "
+                        f"status={record.get('status')} | source={record.get('source_uri')} | "
+                        f"fetched_at={record.get('completed_at') or record.get('requested_at') or 'n/a'} | "
+                        f"output_sha256={record.get('output_sha256', 'n/a')}\n"
+                    )
+            else:
+                f.write("- 本次运行未捕获到工具证据记录。\n")
             f.write(
-                "\n## 证据链与数据来源\n\n"
-                "本报告由以下工具类别为 Agent 提供分析上下文：\n\n"
-                "- 市场：行情数据与技术指标工具\n"
-                "- 情绪：新闻、StockTwits 与 Reddit 数据\n"
-                "- 新闻：公司新闻、全球新闻与内幕交易信息\n"
-                "- 基本面：公司基本面、资产负债表、现金流量表与利润表\n\n"
-                "说明：报告保存 Agent 处理后的证据摘要；原始工具响应不写入公开报告。\n\n---\n"
+                "\n说明：公开报告只保存调用元数据和响应哈希；原始工具响应不写入公开报告。"
+                "这能证明调用发生和结果未被替换，但不等于数据供应商提供了历史 point-in-time 保证。\n\n---\n"
             )
 
         q.put({"type": "done", "ticker": ticker, "date": date})
@@ -377,7 +425,7 @@ def drain_queue():
         pass
 
 
-def start_analysis(ticker: str, date: str):
+def start_analysis(ticker: str, date: str, portfolio_context: dict):
     """启动后台分析线程。"""
     q = queue.Queue()
     st.session_state.status_queue = q
@@ -391,7 +439,7 @@ def start_analysis(ticker: str, date: str):
 
     t = threading.Thread(
         target=_analysis_worker,
-        args=(ticker, date, q),
+        args=(ticker, date, q, portfolio_context),
         daemon=True,
     )
     t.start()
@@ -400,28 +448,13 @@ def start_analysis(ticker: str, date: str):
 
 # ========== 样式 ==========
 
-st.markdown("""
-<style>
-    .metric-card {
-        background: #f8f9fa; padding: 0.8rem; border-radius: 8px;
-        text-align: center; border: 1px solid #eee;
-    }
-    .metric-value { font-size: 1.8rem; font-weight: 700; color: #1f77b4; }
-    .metric-label { font-size: 0.85rem; color: #666; }
-    .stage-grid { display: flex; gap: 0.3rem; flex-wrap: wrap; }
-    .stage-item { flex: 1; min-width: 80px; text-align: center;
-                  padding: 0.4rem 0.2rem; border-radius: 6px;
-                  background: #f8f9fa; font-size: 0.75rem; }
-    .stage-item.done { background: #d4edda; }
-    .stage-item.active { background: #cce5ff; border: 2px solid #007bff; }
-</style>
-""", unsafe_allow_html=True)
+inject_theme()
 
 
 # ========== 侧边栏 ==========
 
-st.sidebar.title("📊 TradingAgents")
-st.sidebar.caption("多智能体金融交易分析面板")
+with st.sidebar:
+    render_sidebar_brand()
 
 # 历史报告列表
 reports = scan_reports()
@@ -442,7 +475,10 @@ if report_labels:
         if match_label in report_map:
             default_idx = report_labels.index(match_label)
 
-    st.sidebar.subheader("📂 历史报告")
+    st.sidebar.markdown(
+        '<div class="ta-side-label">Research library · 历史研究</div>',
+        unsafe_allow_html=True,
+    )
     sel_label = st.sidebar.selectbox(
         "选择报告", report_labels,
         index=default_idx,
@@ -453,8 +489,10 @@ if report_labels:
 else:
     selected_report = None
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🚀 新分析")
+st.sidebar.markdown(
+    '<div class="ta-side-label">New mission · 新分析</div>',
+    unsafe_allow_html=True,
+)
 
 with st.sidebar.form("new_analysis", clear_on_submit=False):
     new_ticker = st.text_input(
@@ -465,6 +503,16 @@ with st.sidebar.form("new_analysis", clear_on_submit=False):
         "分析日期",
         datetime.now(),
     ).strftime("%Y-%m-%d")
+    st.markdown(
+        '<div class="ta-demo-note">Demo Portfolio · 这里的资金与持仓仅用于验证仓位和风险约束，不代表真实账户，也不会触发交易。</div>',
+        unsafe_allow_html=True,
+    )
+    current_price = st.number_input("当前价格（0 表示缺失）", min_value=0.0, value=0.0, step=1.0)
+    demo_portfolio_value = st.number_input("Demo 组合总资产", min_value=1.0, value=100000.0, step=10000.0)
+    demo_cash = st.number_input("Demo 现金", min_value=0.0, value=100000.0, step=10000.0)
+    demo_current_position = st.number_input("当前股票持仓市值", min_value=0.0, value=0.0, step=1000.0)
+    max_single_position_pct = st.slider("单票仓位上限", 1, 100, 10)
+    risk_budget_pct = st.slider("单笔风险预算", 1, 20, 1)
     run_btn = st.form_submit_button(
         "开始分析",
         use_container_width=True,
@@ -473,11 +521,29 @@ with st.sidebar.form("new_analysis", clear_on_submit=False):
     )
 
 if run_btn and st.session_state.app_state != "running":
-    start_analysis(new_ticker, new_date)
+    portfolio_context = {
+        "source": "demo",
+        "cash": demo_cash,
+        "total_portfolio_value": demo_portfolio_value,
+        "current_positions": (
+            {new_ticker: demo_current_position} if demo_current_position > 0 else {}
+        ),
+        "ticker_current_position": demo_current_position,
+        "ticker_current_weight": demo_current_position / demo_portfolio_value,
+        "max_single_position": max_single_position_pct / 100,
+        "risk_budget": risk_budget_pct / 100,
+        "current_price": current_price if current_price > 0 else None,
+        "price_as_of": new_date if current_price > 0 else None,
+        "notes": "User-supplied Demo Portfolio from Streamlit; not a brokerage account.",
+    }
+    start_analysis(new_ticker, new_date, portfolio_context)
     st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.caption("Powered by DeepSeek V4 Flash")
+st.sidebar.markdown(
+    '<div class="ta-system-note"><span class="ta-system-dot"></span>'
+    '<span>Research engine ready · Local advisory mode</span></div>',
+    unsafe_allow_html=True,
+)
 
 
 # ========== 主区域逻辑 ==========
@@ -501,8 +567,6 @@ if st.session_state.app_state == "running":
 
 if st.session_state.app_state == "running":
     # ==================== 运行中 ====================
-    st.title(f"🔄 正在分析 {st.session_state.last_ticker}...")
-
     # 当前阶段推断（最后完成的 stage 的下一个）
     completed = st.session_state.completed_stages
     current_idx = 0
@@ -510,37 +574,37 @@ if st.session_state.app_state == "running":
         if key in completed:
             current_idx = i + 1
 
-    # 阶段进度条
-    cols = st.columns(len(STAGES))
-    for i, (emoji, name, key) in enumerate(STAGES):
-        with cols[i]:
-            done = key in completed
-            active = i == current_idx and not done
-            cls = "done" if done else "active" if active else ""
-            icon = emoji
-            st.markdown(
-                f"<div class='stage-item {cls}' style='font-size:1.2rem'>{icon}</div>"
-                f"<div style='text-align:center;font-size:0.65rem'>{name}</div>"
-                f"<div style='text-align:center;font-size:0.8rem'>{'✅' if done else '🔄' if active else '⏳'}</div>",
-                unsafe_allow_html=True,
-            )
-
-    # 整体进度
     progress = min(len(completed) / len(STAGES), 1.0)
-    st.progress(progress, text=f"{len(completed)}/{len(STAGES)} 阶段完成")
-
-    # 当前阶段名
     if current_idx < len(STAGES):
         _, cur_name, _ = STAGES[current_idx]
-        st.markdown(f"**当前**: {STAGES[current_idx][0]} {cur_name}")
     else:
-        st.markdown("**当前**: 🎉 所有阶段已完成，正在保存报告…")
+        cur_name = "全部阶段完成，正在固化报告与审计记录"
+
+    render_running_header(
+        st.session_state.last_ticker,
+        st.session_state.last_date,
+        progress,
+        cur_name,
+    )
+    render_section_head(
+        "Orchestration map",
+        "Agent协作进度",
+        f"{len(completed)} / {len(STAGES)} 个业务阶段已完成",
+    )
+    render_stage_rail(
+        STAGES,
+        completed,
+        current_idx if current_idx < len(STAGES) else None,
+    )
 
     # 日志区
-    log = st.session_state.analysis_log
-    with st.container():
-        st.markdown("**运行日志**")
-        st.code("\n".join(log[-30:]) if log else "等待输出…", language="text")
+    render_section_head(
+        "Event stream",
+        "实时任务事件",
+        "仅展示节点状态，不展示模型隐藏推理过程",
+    )
+    render_terminal(st.session_state.analysis_log)
+    render_legal_footer()
 
     # 自动刷新
     time.sleep(1)
@@ -551,7 +615,11 @@ elif st.session_state.app_state == "done":
     # ==================== 完成 ====================
     ticker = st.session_state.last_ticker
     date = st.session_state.last_date
-    st.success(f"✅ {ticker} 分析完成！")
+    render_state_card(
+        "success",
+        f"{ticker} 研究任务已完成",
+        f"七个业务阶段已经结束，报告、结构化决策和审计记录已保存。数据截止 {date}。",
+    )
 
     # 自动设置 current_report 以便展示
     st.session_state.current_report = {"ticker": ticker, "date": date}
@@ -559,7 +627,7 @@ elif st.session_state.app_state == "done":
     with st.expander("📜 查看运行日志", expanded=False):
         st.code("\n".join(st.session_state.analysis_log), language="text")
 
-    if st.button("📊 查看完整报告", type="primary", use_container_width=True):
+    if st.button("打开研究报告  →", type="primary", use_container_width=True):
         st.session_state.app_state = "idle"
         st.rerun()
 
@@ -567,7 +635,11 @@ elif st.session_state.app_state == "done":
 
 elif st.session_state.app_state == "error":
     # ==================== 错误 ====================
-    st.error(f"❌ 分析失败: {st.session_state.last_ticker}")
+    render_state_card(
+        "error",
+        f"{st.session_state.last_ticker} 研究任务未完成",
+        "系统已停止生成最终结论。请查看错误详情，修复数据、模型或配置问题后再重试。",
+    )
 
     with st.expander("🔍 错误详情", expanded=False):
         st.code(st.session_state.error_detail, language="text")
@@ -575,7 +647,7 @@ elif st.session_state.app_state == "error":
     with st.expander("📜 运行日志", expanded=False):
         st.code("\n".join(st.session_state.analysis_log), language="text")
 
-    if st.button("🔄 重试", use_container_width=True):
+    if st.button("返回并重新配置  →", use_container_width=True):
         st.session_state.app_state = "idle"
         st.rerun()
 
@@ -591,7 +663,8 @@ elif selected_report:
     report_meta = selected_report
     report_path = report_meta["path"]
 else:
-    st.info("👈 左侧选择一个报告，或输入股票代码开始新分析")
+    render_empty_state()
+    render_legal_footer()
     st.stop()
 
 if not report_path.exists():
@@ -601,97 +674,157 @@ if not report_path.exists():
 
 md = report_path.read_text(encoding="utf-8")
 sections = parse_sections(md)
-info = extract_info(sections)
+info = extract_info(sections)  # Legacy Markdown report compatibility.
+decision_path = report_path.with_name("decision.json")
+if decision_path.exists():
+    try:
+        from tradingagents.report_artifacts import (
+            dashboard_summary_from_artifact,
+            load_decision_artifact,
+        )
 
-action_colors = {
-    "BUY": "#28a745", "SELL": "#dc3545", "HOLD": "#ffc107",
-    "UNDERWEIGHT": "#dc3545", "OVERWEIGHT": "#28a745",
-}
-ac = action_colors.get(info["signal"].upper(), "gray")
+        artifact = load_decision_artifact(decision_path)
+        typed_summary = dashboard_summary_from_artifact(artifact)
+        # Legacy v1 artifacts do not contain a final action; preserve the
+        # Trader action extracted from old Markdown only for that compatibility path.
+        if typed_summary["action"] is None:
+            typed_summary["action"] = info["action"]
+        info.update(typed_summary)
+    except (OSError, ValueError, TypeError) as exc:
+        st.warning(f"结构化决策文件无效，已回退为 Markdown 展示：{exc}")
 
 ticker_display = report_meta["ticker"]
 date_display = report_meta["date"]
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.title(f"{ticker_display} 完整分析报告")
-    st.caption(f"分析日期: {date_display}")
-with col2:
-    st.markdown(f"<h1 style='text-align:right; color:{ac}'>{info['signal']}</h1>", unsafe_allow_html=True)
+render_report_hero(ticker_display, date_display, info["signal"])
 
-with st.expander("🧩 系统 Agent 架构（12 个角色 / 7 个业务阶段）", expanded=False):
-    role_cols = st.columns(3)
-    for i, (role, label, _) in enumerate(AGENT_ROLES):
-        with role_cols[i % 3]:
-            st.markdown(f"**{i + 1}. {role}**  \n{label}")
+tone_map = {
+    "buy": "green",
+    "sell": "red",
+    "hold": "amber",
+    "neutral": "violet",
+}
+decision_tone = tone_map[signal_tone(info["signal"])]
+risk_text = str(info.get("risk_validation") or "N/A")
+risk_tone = "green" if risk_text.upper() in {"PASS", "PASSED", "APPROVED"} else "amber"
+render_metric_grid([
+    {
+        "label": "最终评级",
+        "value": info.get("rating") or "N/A",
+        "hint": "Portfolio Manager + Hard Risk",
+        "tone": decision_tone,
+    },
+    {
+        "label": "交易建议",
+        "value": info.get("action") or "N/A",
+        "hint": "Advisory action",
+        "tone": decision_tone,
+    },
+    {
+        "label": "目标价",
+        "value": f"${info['price']}" if info.get("price") not in {None, "N/A"} else "N/A",
+        "hint": "Model-derived target",
+        "tone": "violet",
+    },
+    {
+        "label": "止损位",
+        "value": f"${info['stop']}" if info.get("stop") not in {None, "N/A"} else "N/A",
+        "hint": "Deterministic risk input",
+        "tone": "red",
+    },
+    {
+        "label": "硬风控",
+        "value": risk_text,
+        "hint": "Non-LLM validation gate",
+        "tone": risk_tone,
+    },
+])
 
-# 指标卡
-mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-for c, v, l in [
-    (mcol1, info["rating"], "最终评级"),
-    (mcol2, info["action"], "建议"),
-    (mcol3, f"${info['price']}" if info['price'] != 'N/A' else 'N/A', "目标价"),
-    (mcol4, f"${info['stop']}" if info['stop'] != 'N/A' else 'N/A', "止损"),
-]:
-    c.markdown(
-        f"<div class='metric-card'><div class='metric-value'>{v}</div>"
-        f"<div class='metric-label'>{l}</div></div>",
-        unsafe_allow_html=True,
+render_section_head(
+    "Decision pipeline",
+    "多智能体研究链路",
+    "四类研究输入 → 多空辩论 → 交易提案 → 风险争论 → 硬风控",
+)
+completed_report_stages = {
+    key for _, _, key in STAGES if sections.get(key, "").strip()
+}
+render_stage_rail(STAGES, completed_report_stages)
+
+with st.expander("查看12个Agent角色与系统边界", expanded=False):
+    render_agent_grid(AGENT_ROLES)
+    st.caption(
+        "Portfolio Manager 之后由非 LLM 的 Hard Risk Engine 执行确定性约束；"
+        "该组件是代码风控闸门，不计入 12 个 Agent。"
     )
 
-st.divider()
+render_section_head(
+    "Research workspace",
+    "完整研究报告",
+    "先读最终决策，再按需下钻研究、辩论、风险和证据",
+)
 
-# 团队流程
-st.subheader("🤖 多智能体分析流程")
-cols = st.columns(len(STAGES))
-for i, (emoji, name, key) in enumerate(STAGES):
-    done = key in sections and sections[key].strip()
-    with cols[i]:
-        st.markdown(
-            f"<div style='text-align:center;padding:0.5rem'>"
-            f"<div style='font-size:1.5rem'>{emoji}</div>"
-            f"<div style='font-size:0.7rem;font-weight:600'>{name}</div>"
-            f"<div>{'✅' if done else '⏳'}</div></div>",
-            unsafe_allow_html=True,
-        )
 
-st.divider()
-
-# 报告正文
-for emoji, title, key in STAGES:
-    if key in sections and sections[key].strip():
-        with st.expander(f"{emoji} **{title}**", expanded=(key in ["final_trade_decision", "investment_plan"])):
-            st.markdown(sections[key])
+def render_report_section(key: str, title: str, *, expanded: bool = False) -> None:
+    content = sections.get(key, "").strip()
+    if content:
+        with st.expander(title, expanded=expanded):
+            # Streamlit treats paired dollar signs as LaTeX delimiters.  A
+            # financial report contains many currency values such as $310, so
+            # escape only dollar signs immediately followed by a digit.  The
+            # stored/downloaded Markdown remains unchanged.
+            display_content = re.sub(r"(?<!\\)\$(?=\d)", r"\\$", content)
+            st.markdown(display_content)
     else:
-        with st.expander(f"⏳ **{title}** _(等待分析…)_", expanded=False):
-            st.info("该部分尚未生成。")
+        with st.expander(f"{title} · 暂无内容", expanded=False):
+            st.caption("当前报告没有生成这一部分。")
 
-for emoji, title, key in [
-    ("🛡️", "风险评估辩论", "risk_assessment"),
-    ("🔗", "证据链与数据来源", "evidence_chain"),
-]:
-    if key in sections and sections[key].strip():
-        with st.expander(f"{emoji} **{title}**", expanded=False):
-            st.markdown(sections[key])
 
-st.divider()
+overview_tab, research_tab, debate_tab, risk_tab = st.tabs([
+    "决策总览",
+    "四维研究",
+    "辩论与提案",
+    "风险与证据",
+])
+
+with overview_tab:
+    render_report_section("final_trade_decision", "最终风险约束决策", expanded=True)
+
+with research_tab:
+    render_report_section("market_report", "市场与技术面", expanded=True)
+    render_report_section("fundamentals_report", "基本面与财务")
+    render_report_section("news_report", "新闻与事件")
+    render_report_section("sentiment_report", "市场情绪与社媒")
+
+with debate_tab:
+    render_report_section("investment_plan", "多空研究辩论与研究经理结论", expanded=True)
+    render_report_section("trader_investment_plan", "交易员执行提案")
+
+with risk_tab:
+    render_report_section("risk_assessment", "三类风险分析师辩论", expanded=True)
+    render_report_section("evidence_chain", "工具证据链与数据来源")
 
 # 底部操作
-col1, col2 = st.columns(2)
+render_section_head("Report actions", "报告操作", "导出Markdown或查看本地审计文件")
+col1, col2, col3 = st.columns(3)
 with col1:
     report_dir_to_open = report_path.parent
-    if os.name == "nt" and st.button("📂 打开报告文件夹"):
+    if os.name == "nt" and st.button("打开本地报告目录", use_container_width=True):
         os.startfile(str(report_dir_to_open))
 with col2:
     st.download_button(
-        "⬇️ 下载报告",
+        "下载Markdown报告",
         data=md,
         file_name=f"{ticker_display}_{date_display}_report.md",
         mime="text/markdown",
+        use_container_width=True,
     )
+with col3:
+    # 清除 current_report 后让侧边栏历史选择器接管。
+    if st.session_state.current_report is not None:
+        if st.button("返回历史研究库", use_container_width=True):
+            st.session_state.current_report = None
+            st.rerun()
+    else:
+        st.button("当前已在研究库", disabled=True, use_container_width=True)
 
-# 清除 current_report 点击后让 sidebar selectbox 接管
-if st.session_state.current_report is not None:
-    if st.button("← 返回报告列表"):
-        st.session_state.current_report = None
-        st.rerun()
+render_legal_footer()

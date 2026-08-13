@@ -74,7 +74,37 @@ def invoke_structured_or_freetext(
     agent_name: str,
     allow_fallback: bool = True,
 ) -> str:
-    """Run the structured call and render to markdown; fall back to free-text on any failure.
+    """Run the structured call and return its markdown representation.
+
+    This compatibility wrapper keeps existing analyst nodes string-based.  A
+    decision node that must preserve the typed object across a State boundary
+    should instead use :func:`invoke_structured_or_freetext_with_artifact`.
+    """
+    rendered, _ = invoke_structured_or_freetext_with_artifact(
+        structured_llm=structured_llm,
+        plain_llm=plain_llm,
+        prompt=prompt,
+        render=render,
+        agent_name=agent_name,
+        allow_fallback=allow_fallback,
+    )
+    return rendered
+
+
+def invoke_structured_or_freetext_with_artifact(
+    structured_llm: Optional[Any],
+    plain_llm: Any,
+    prompt: Any,
+    render: Callable[[T], str],
+    agent_name: str,
+    allow_fallback: bool = True,
+) -> tuple[str, Optional[T]]:
+    """Return rendered text plus the parsed Pydantic object when available.
+
+    A markdown rendering is convenient for prompts and reports, but it is not
+    a reliable machine contract.  This helper lets critical nodes keep both:
+    prose for people and a typed artifact for downstream systems.  The typed
+    value is ``None`` only on an explicitly allowed free-text fallback.
 
     ``prompt`` is whatever the underlying LLM accepts (a string for chat
     invocations, a list of message dicts for chat models that take that
@@ -91,7 +121,7 @@ def invoke_structured_or_freetext(
             result = structured_llm.invoke(prompt)
             if result is None:
                 raise ValueError("structured-output provider returned an empty result")
-            return render(result)
+            return render(result), result
         except Exception as exc:
             if not allow_fallback:
                 logger.warning(
@@ -102,7 +132,7 @@ def invoke_structured_or_freetext(
                     result = structured_llm.invoke(_structured_retry_prompt(prompt))
                     if result is None:
                         raise ValueError("structured-output retry returned an empty result")
-                    return render(result)
+                    return render(result), result
                 except Exception as retry_exc:
                     raise RuntimeError(
                         f"{agent_name} structured output failed after one schema retry; "
@@ -114,4 +144,4 @@ def invoke_structured_or_freetext(
             )
 
     response = plain_llm.invoke(prompt)
-    return response.content
+    return response.content, None
